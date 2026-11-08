@@ -1,0 +1,218 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { Server, type Socket } from 'socket.io';
+import {
+  ClientActionSchema, CreateRoomSchema, JoinRoomSchema, ResumeSchema,
+  type Ack, type ClientToServerEvents, type ServerToClientEvents,
+} from '@reverse-poker/shared';
+import { RoomManager, type Room, type RoomPlayer } from '../game/room';
+
+type NoEvents = Record<string, never>;
+
+interface SocketData {
+  roomCode?: string;
+  playerId?: string;
+  failedAttempts: number;
+}
+
+type GameSocket = Socket<ClientToServerEvents, ServerToClientEvents, NoEvents, SocketData>;
+
+const ROOM_IDLE_MS = 10 * 60 * 1000;
+const MAX_FAILED_ATTEMPTS = 10;
+
+export interface GameServerOptions {
+  port: number; // 0 = pick a free port (used by tests)
+  clientOrigin?: string | string[];
+}
+
+export interface GameServer {
+  port: number;
+  rooms: RoomManager;
+  close(): Promise<void>;
+}
+
+/** Clients may omit the ack callback; never assume it exists. */
+function respond<T extends object>(ack: ((res: Ack<T>) => void) | undefined, result: Ack<T>): void {
+  if (typeof ack === 'function') ack(result);
+}
+
+export async function startGameServer(opts: GameServerOptions): Promise<GameServer> {
+  const rooms = new RoomManager();
+
+  const httpServer = createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const io = new Server<ClientToServerEvents, ServerToClientEvents, NoEvents, SocketData>(httpServer, {
+    cors: { origin: opts.clientOrigin ?? 'http://localhost:5173' },
+    maxHttpBufferSize: 16 * 1024, // our messages are tiny; refuse big ones
+  });
+
+  const cleanupTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * THE ONLY place game state leaves the server. Each player gets their own
+   * personalised view. Never use io.to(room).emit() for table state.
+   */
+  function broadcast(room: Room): void {
+    for (const player of room.players.values()) {
+      if (!player.socketId) continue;
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (!socket) continue;
+      socket.emit('room:lobby', room.lobbyViewFor(player.playerId));
+      const view = room.tableViewFor(player.playerId);
+      if (view) socket.emit('table:view', view);
+    }
+  }
+
+  function attach(socket: GameSocket, room: Room, player: RoomPlayer): void {
+    // One live connection per player: a newer one replaces an older one.
+    if (player.socketId && player.socketId !== socket.id) {
+      io.sockets.sockets.get(player.socketId)?.disconnect(true);
+    }
+    player.socketId = socket.id;
+    socket.data.roomCode = room.code;
+    socket.data.playerId = player.playerId;
+    const timer = cleanupTimers.get(room.code);
+    if (timer) {
+      clearTimeout(timer);
+      cleanupTimers.delete(room.code);
+    }
+  }
+
+  /** Identity comes from the server-side binding, never from the message. */
+  function current(socket: GameSocket): { room: Room; playerId: string } | null {
+    const { roomCode, playerId } = socket.data;
+    if (!roomCode || !playerId) return null;
+    const room = rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+    if (!room || !player || player.socketId !== socket.id) return null;
+    return { room, playerId };
+  }
+
+  function noteFailure(socket: GameSocket): void {
+    socket.data.failedAttempts += 1;
+    if (socket.data.failedAttempts >= MAX_FAILED_ATTEMPTS) socket.disconnect(true);
+  }
+
+  function scheduleCleanup(room: Room): void {
+    if (room.hasConnectedPlayers()) return;
+    clearTimeout(cleanupTimers.get(room.code));
+    const timer = setTimeout(() => {
+      cleanupTimers.delete(room.code);
+      if (!room.hasConnectedPlayers()) rooms.delete(room.code);
+    }, ROOM_IDLE_MS);
+    timer.unref();
+    cleanupTimers.set(room.code, timer);
+  }
+
+  io.on('connection', (socket) => {
+    socket.data.failedAttempts = 0;
+
+    socket.on('room:create', (raw, ack) => {
+      if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
+      const parsed = CreateRoomSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+
+      const room = rooms.create();
+      const added = room.addPlayer(parsed.data.name);
+      if (!added.ok) return respond(ack, added);
+      attach(socket, room, added.player);
+      respond(ack, {
+        ok: true,
+        session: { code: room.code, playerId: added.player.playerId, token: added.player.token },
+      });
+      broadcast(room);
+    });
+
+    socket.on('room:join', (raw, ack) => {
+      if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
+      const parsed = JoinRoomSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+
+      const room = rooms.get(parsed.data.code);
+      if (!room) {
+        noteFailure(socket);
+        return respond(ack, { ok: false, error: 'room_not_found' });
+      }
+      const added = room.addPlayer(parsed.data.name);
+      if (!added.ok) return respond(ack, added);
+      attach(socket, room, added.player);
+      respond(ack, {
+        ok: true,
+        session: { code: room.code, playerId: added.player.playerId, token: added.player.token },
+      });
+      broadcast(room);
+    });
+
+    socket.on('room:resume', (raw, ack) => {
+      if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
+      const parsed = ResumeSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+
+      const room = rooms.get(parsed.data.code);
+      const player = room?.authenticate(parsed.data.playerId, parsed.data.token);
+      if (!room || !player) {
+        noteFailure(socket);
+        return respond(ack, { ok: false, error: 'bad_session' });
+      }
+      attach(socket, room, player);
+      respond(ack, {
+        ok: true,
+        session: { code: room.code, playerId: player.playerId, token: player.token },
+      });
+      broadcast(room); // sends this player a fresh personalised snapshot
+    });
+
+    socket.on('game:start', (ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const result = cur.room.startNextHand(cur.playerId);
+      respond(ack, result);
+      if (result.ok) broadcast(cur.room);
+    });
+
+    socket.on('game:action', (raw, ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const parsed = ClientActionSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+      const result = cur.room.act(cur.playerId, parsed.data);
+      respond(ack, result);
+      if (result.ok) broadcast(cur.room);
+    });
+
+    socket.on('disconnect', () => {
+      const { roomCode, playerId } = socket.data;
+      if (!roomCode || !playerId) return;
+      const room = rooms.get(roomCode);
+      const player = room?.players.get(playerId);
+      // Ignore stale sockets that were already replaced by a newer connection.
+      if (!room || !player || player.socketId !== socket.id) return;
+      player.socketId = null;
+      broadcast(room);
+      scheduleCleanup(room);
+    });
+  });
+
+  await new Promise<void>((resolve) => {
+    httpServer.listen(opts.port, resolve);
+  });
+  const port = (httpServer.address() as AddressInfo).port;
+
+  return {
+    port,
+    rooms,
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const timer of cleanupTimers.values()) clearTimeout(timer);
+        io.close(() => resolve());
+      }),
+  };
+}

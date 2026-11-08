@@ -1,0 +1,17 @@
+{
+  "name": "@reverse-poker/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@reverse-poker/poker-engine": "workspace:*",
+    "@reverse-poker/shared": "workspace:*",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}
