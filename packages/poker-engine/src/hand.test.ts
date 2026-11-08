@@ -122,7 +122,7 @@ describe('betting rounds', () => {
   it('awards the pot when everyone else folds', () => {
     const s = play(start3(), [['p0', fold], ['p1', fold]]);
     expect(s.phase).toBe('complete');
-    expect(s.result).toEqual({ winners: [{ seat: 2, amount: 15, rank: null }], showdown: false });
+    expect(s.result).toEqual({ winners: [{ seat: 2, amount: 15, rank: null }], refunds: [], showdown: false });
     expect(s.seats.map((x) => x.stack)).toEqual([1000, 995, 1005]);
     expect(applyAction(s, 'p2', check)).toEqual({ ok: false, error: 'hand_over' });
   });

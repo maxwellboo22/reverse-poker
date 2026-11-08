@@ -19,6 +19,21 @@ export interface HandRank {
   tiebreak: number[];       // ranks in order of importance, compared left to right
 }
 
+export interface EvalOptions {
+  /**
+   * Also count J-Q-K-A-2, Q-K-A-2-3 and K-A-2-3-4 as straights. They rank below
+   * A-2-3-4-5, ordered by their last card, so J-Q-K-A-2 is the lowest straight.
+   */
+  wrapAroundStraights?: boolean;
+}
+
+// The extra straights, as ranks in descending order, with the card they end on.
+const WRAP_STRAIGHTS = [
+  { top: 4, ranks: [14, 13, 4, 3, 2] },
+  { top: 3, ranks: [14, 13, 12, 3, 2] },
+  { top: 2, ranks: [14, 13, 12, 11, 2] },
+] as const;
+
 export function describeRank(r: HandRank): string {
   return HAND_CATEGORIES[r.category];
 }
@@ -35,7 +50,7 @@ export function compareRanks(a: HandRank, b: HandRank): number {
 }
 
 /** Rank exactly five cards. */
-export function rankFive(cards: readonly Card[]): HandRank {
+export function rankFive(cards: readonly Card[], opts: EvalOptions = {}): HandRank {
   if (cards.length !== 5) throw new Error('rankFive needs exactly 5 cards');
 
   const counts = new Map<number, number>();
@@ -52,10 +67,16 @@ export function rankFive(cards: readonly Card[]): HandRank {
 
   let straightHigh = 0;
   if (groups.length === 5) {
-    const high = groups[0]!.rank;
-    const low = groups[4]!.rank;
-    if (high - low === 4) straightHigh = high;
-    else if (high === 14 && groups[1]!.rank === 5 && low === 2) straightHigh = 5; // A-2-3-4-5
+    const high = tiebreak[0]!;
+    const low = tiebreak[4]!;
+    if (high - low === 4) {
+      straightHigh = high;
+    } else if (high === 14 && tiebreak[1] === 5 && low === 2) {
+      straightHigh = 5; // A-2-3-4-5
+    } else if (opts.wrapAroundStraights) {
+      const wrap = WRAP_STRAIGHTS.find((w) => w.ranks.every((r, i) => r === tiebreak[i]));
+      if (wrap) straightHigh = wrap.top;
+    }
   }
 
   if (straightHigh && isFlush) return { category: 8, tiebreak: [straightHigh] };
@@ -70,13 +91,13 @@ export function rankFive(cards: readonly Card[]): HandRank {
 }
 
 /** Best five-card hand from 5 to 7 cards. */
-export function rankBest(cards: readonly Card[]): HandRank {
+export function rankBest(cards: readonly Card[], opts: EvalOptions = {}): HandRank {
   if (cards.length < 5 || cards.length > 7) {
     throw new Error('rankBest needs 5 to 7 cards');
   }
   let best: HandRank | null = null;
   for (const combo of combinations(cards, 5)) {
-    const r = rankFive(combo);
+    const r = rankFive(combo, opts);
     if (best === null || compareRanks(r, best) > 0) best = r;
   }
   return best!;

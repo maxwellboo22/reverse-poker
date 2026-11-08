@@ -2,11 +2,13 @@
   "name": "reverse-poker",
   "private": true,
   "type": "module",
-  "scripts": {
+    "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "play": "tsx packages/poker-engine/scripts/play.ts"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p apps/web",
+    "play": "tsx packages/poker-engine/scripts/play.ts",
+    "dev:server": "pnpm --filter @reverse-poker/server dev",
+    "dev:web": "pnpm --filter @reverse-poker/web dev"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

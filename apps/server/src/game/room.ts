@@ -1,13 +1,13 @@
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
-  MAX_PLAYERS, ROOM_CODE_ALPHABET, ROOM_CODE_LENGTH,
-  type Ack, type ClientAction, type LobbyView, type TableView,
+  DEFAULT_SETTINGS, MAX_CHIPS, MAX_PLAYERS, ROOM_CODE_ALPHABET, ROOM_CODE_LENGTH, SettingsSchema,
+  type Ack, type ClientAction, type LobbyView, type RoomSettings, type TableView,
 } from '@reverse-poker/shared';
-import { applyAction, startHand, toTableView, type HandState } from '@reverse-poker/poker-engine';
+import {
+  applyAction, forceFold, startHand, toTableView, type HandState,
+} from '@reverse-poker/poker-engine';
 
 export const STARTING_CHIPS = 1000;
-export const SMALL_BLIND = 5;
-export const BIG_BLIND = 10;
 
 export interface RoomPlayer {
   playerId: string;
@@ -21,6 +21,7 @@ export class Room {
   readonly code: string;
   hostId: string | null = null;
   readonly players = new Map<string, RoomPlayer>(); // insertion order = seat order
+  settings: RoomSettings = { ...DEFAULT_SETTINGS };
   hand: HandState | null = null;
   private handsPlayed = 0;
 
@@ -58,6 +59,73 @@ export class Room {
     return { ok: true, player };
   }
 
+  /**
+   * Removes a player. Mid-hand they fold, and what they bet this round is
+   * returned (see forceFold). If the host leaves, host passes to the first
+   * connected player. Returns false if the player wasn't in the room.
+   */
+  removePlayer(playerId: string): boolean {
+    if (!this.players.has(playerId)) return false;
+
+    if (this.handInProgress && this.hand!.seats.some((s) => s.playerId === playerId)) {
+      const folded = forceFold(this.hand!, playerId);
+      if (folded.ok) {
+        this.hand = folded.state;
+        this.syncChips();
+      }
+    }
+    this.players.delete(playerId);
+
+    if (this.hostId === playerId) {
+      const remaining = [...this.players.values()];
+      this.hostId = (remaining.find((p) => p.socketId !== null) ?? remaining[0])?.playerId ?? null;
+    }
+    return true;
+  }
+
+  /** Host only: removes another player. Returns their socket id so the server can tell them. */
+  kick(requesterId: string, targetId: string): Ack<{ socketId: string | null }> {
+    if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };
+    if (targetId === requesterId) return { ok: false, error: 'cannot_kick_self' };
+    const target = this.players.get(targetId);
+    if (!target) return { ok: false, error: 'no_such_player' };
+    const socketId = target.socketId;
+    this.removePlayer(targetId);
+    return { ok: true, socketId };
+  }
+
+  /** Host only. Applies from the next hand; a hand in progress keeps its rules. */
+  setSettings(requesterId: string, input: unknown): Ack {
+    if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };
+    const parsed = SettingsSchema.safeParse(input);
+    if (!parsed.success) return { ok: false, error: 'bad_request' };
+    if (parsed.data.smallBlind > parsed.data.bigBlind) return { ok: false, error: 'blinds_order' };
+    this.settings = parsed.data;
+    return { ok: true };
+  }
+
+  /** Host only: abandons the current hand and gives everyone the starting chips. */
+  resetLobby(requesterId: string): Ack {
+    if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };
+    this.hand = null;
+    this.handsPlayed = 0;
+    for (const p of this.players.values()) p.chips = STARTING_CHIPS;
+    return { ok: true };
+  }
+
+  /** Host only, and only between hands (changing a stack mid-hand would corrupt the pots). */
+  setChips(requesterId: string, targetId: string, chips: number): Ack {
+    if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };
+    if (this.handInProgress) return { ok: false, error: 'hand_in_progress' };
+    const target = this.players.get(targetId);
+    if (!target) return { ok: false, error: 'no_such_player' };
+    if (!Number.isInteger(chips) || chips < 0 || chips > MAX_CHIPS) {
+      return { ok: false, error: 'bad_request' };
+    }
+    target.chips = chips;
+    return { ok: true };
+  }
+
   /** Checks a reconnect token in constant time. */
   authenticate(playerId: string, token: string): RoomPlayer | null {
     const player = this.players.get(playerId);
@@ -78,8 +146,11 @@ export class Room {
     this.hand = startHand({
       players: seated.map((p) => ({ playerId: p.playerId, name: p.name, stack: p.chips })),
       buttonSeat: this.handsPlayed % seated.length, // simple rotation for the MVP
-      smallBlind: SMALL_BLIND,
-      bigBlind: BIG_BLIND,
+      smallBlind: this.settings.smallBlind,
+      bigBlind: this.settings.bigBlind,
+      minRaise: this.settings.minRaise,
+      bettingRounds: this.settings.bettingRounds,
+      wrapAroundStraights: this.settings.wrapAroundStraights,
     });
     this.handsPlayed += 1;
     this.syncChips(); // a hand can finish instantly if blinds put someone all-in
@@ -112,6 +183,7 @@ export class Room {
       you: playerId,
       hostId: this.hostId ?? '',
       handInProgress: this.handInProgress,
+      settings: { ...this.settings },
       players: [...this.players.values()].map((p) => ({
         playerId: p.playerId,
         name: p.name,

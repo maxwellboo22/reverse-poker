@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Server, type Socket } from 'socket.io';
 import {
-  ClientActionSchema, CreateRoomSchema, JoinRoomSchema, ResumeSchema,
+    ClientActionSchema, CreateRoomSchema, JoinRoomSchema, KickSchema, ResumeSchema, SetChipsSchema,
   type Ack, type ClientToServerEvents, type ServerToClientEvents,
 } from '@reverse-poker/shared';
 import { RoomManager, type Room, type RoomPlayer } from '../game/room';
@@ -68,6 +68,13 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       socket.emit('room:lobby', room.lobbyViewFor(player.playerId));
       const view = room.tableViewFor(player.playerId);
       if (view) socket.emit('table:view', view);
+    }
+  }
+
+  /** Tells every connected player to drop whatever table they are showing. */
+  function clearTables(room: Room): void {
+    for (const player of room.players.values()) {
+      if (player.socketId) io.sockets.sockets.get(player.socketId)?.emit('table:clear');
     }
   }
 
@@ -170,6 +177,26 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(room); // sends this player a fresh personalised snapshot
     });
 
+    socket.on('room:leave', (ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const { room, playerId } = cur;
+
+      room.removePlayer(playerId); // folds them first if a hand is running
+      socket.data.roomCode = undefined;
+      socket.data.playerId = undefined;
+      respond(ack, { ok: true });
+
+      if (room.players.size === 0) {
+        clearTimeout(cleanupTimers.get(room.code));
+        cleanupTimers.delete(room.code);
+        rooms.delete(room.code);
+      } else {
+        broadcast(room);
+        scheduleCleanup(room);
+      }
+    });
+
     socket.on('game:start', (ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
@@ -178,6 +205,56 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       if (result.ok) broadcast(cur.room);
     });
 
+    socket.on('game:reset', (ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const result = cur.room.resetLobby(cur.playerId);
+      respond(ack, result);
+      if (result.ok) {
+        clearTables(cur.room);
+        broadcast(cur.room);
+      }
+    });
+
+    socket.on('host:setChips', (raw, ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const parsed = SetChipsSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+      const result = cur.room.setChips(cur.playerId, parsed.data.playerId, parsed.data.chips);
+      respond(ack, result);
+      if (result.ok) broadcast(cur.room);
+    });
+        socket.on('host:setSettings', (raw, ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const result = cur.room.setSettings(cur.playerId, raw);
+      respond(ack, result);
+      if (result.ok) broadcast(cur.room);
+    });
+
+    socket.on('host:kick', (raw, ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+      const parsed = KickSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+
+      const result = cur.room.kick(cur.playerId, parsed.data.playerId);
+      if (!result.ok) return respond(ack, result);
+
+      // Cut the kicked player's connection off from the room, and tell them why.
+      if (result.socketId) {
+        const kicked = io.sockets.sockets.get(result.socketId);
+        if (kicked) {
+          kicked.data.roomCode = undefined;
+          kicked.data.playerId = undefined;
+          kicked.emit('room:kicked');
+        }
+      }
+      respond(ack, { ok: true });
+      broadcast(cur.room); // the kicked player is already gone from the room, so they get nothing
+    });
+    
     socket.on('game:action', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });

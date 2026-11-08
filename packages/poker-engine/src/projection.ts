@@ -37,9 +37,9 @@ function resultView(hand: HandState, viewerSeat: number, revealOwn: boolean): Ha
       }
       return { seat: w.seat, amount: w.amount, handDescription: describeRank(w.rank) };
     }),
+    refunds: hand.result.refunds.map((r) => ({ seat: r.seat, amount: r.amount })),
   };
 }
-
 /**
  * The ONLY function that turns server state into something a client may see.
  * Everything is listed explicitly (allowlist), so new server-only fields stay hidden.

@@ -21,8 +21,19 @@ export interface Pot {
   eligibleSeats: number[];
 }
 
+/** The betting round exactly as it was just before the latest bet or raise. */
+export interface RaiseSnapshot {
+  seat: number; // who made the bet or raise
+  currentBet: number;
+  lastRaiseSize: number;
+  seats: { committedThisRound: number; hasActedThisRound: boolean; status: SeatStatus }[];
+}
+
 export interface HandResult {
+  /** Chips won from contested pots (or from everyone folding). */
   winners: { seat: number; amount: number; rank: HandRank | null }[];
+  /** Uncalled bets handed back. This is NOT winnings. */
+  refunds: { seat: number; amount: number }[];
   showdown: boolean; // false if everyone else folded
 }
 
@@ -40,6 +51,10 @@ export interface HandState {
   toAct: number | null;
   currentBet: number;
   lastRaiseSize: number;
+  lastRaise: RaiseSnapshot | null; // lets a leaver's bet be undone
+  minRaise: number; // smallest raise increment at the start of each betting round
+  bettingRounds: number; // 1 to 4
+  wrapAroundStraights: boolean;
   pots: Pot[];
   result: HandResult | null;
 }

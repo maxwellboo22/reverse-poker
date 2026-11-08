@@ -62,7 +62,8 @@ describe('all-ins and side pots', () => {
 
     expect(s.phase).toBe('complete');
     // Contested: 60 + 60 = 120 -> seat 1. Seat 0 gets its extra 140 back.
-    expect(s.result!.winners.map((w) => [w.seat, w.amount])).toEqual([[1, 120], [0, 140]]);
+    expect(s.result!.winners.map((w) => [w.seat, w.amount])).toEqual([[1, 120]]);
+    expect(s.result!.refunds).toEqual([{ seat: 0, amount: 140 }]);
     expect(s.seats.map((x) => x.stack)).toEqual([940, 120]);
     expect(totalChips(s)).toBe(1060);
   });
@@ -77,7 +78,8 @@ describe('all-ins and side pots', () => {
 
     expect(s.phase).toBe('complete');
     expect(s.board).toHaveLength(5);
-    expect(s.result!.winners.map((w) => [w.seat, w.amount])).toEqual([[1, 7], [0, 6]]);
+    expect(s.result!.winners.map((w) => [w.seat, w.amount])).toEqual([[0, 6]]);
+    expect(s.result!.refunds).toEqual([{ seat: 1, amount: 7 }]);
     expect(s.seats.map((x) => x.stack)).toEqual([6, 97]);
     expect(totalChips(s)).toBe(103);
   });

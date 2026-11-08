@@ -31,6 +31,8 @@ export interface LegalActions {
 
 export interface HandResultView {
   winners: { seat: number; amount: number; handDescription?: string }[];
+  /** Uncalled bets handed back. Not winnings. */
+  refunds: { seat: number; amount: number }[];
 }
 
 export interface TableView {
