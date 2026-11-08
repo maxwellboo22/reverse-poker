@@ -1,35 +1,25 @@
 import type { LegalActions } from '@reverse-poker/shared';
 import type { HandState } from './types';
 
-export function minRaiseTo(hand: HandState): number {
-  return hand.currentBet + hand.lastRaiseSize;
-}
-
-/**
- * Milestone 1 rule: nobody may be forced all-in, so the highest legal
- * raise-to leaves every live player with at least 1 chip.
- */
-export function maxRaiseTo(hand: HandState): number {
-  let cap = Infinity;
-  for (const s of hand.seats) {
-    if (s.status !== 'folded') cap = Math.min(cap, s.committedThisRound + s.stack - 1);
-  }
-  return cap;
-}
-
 export function computeLegalActions(hand: HandState, seatIndex: number): LegalActions | null {
   if (hand.phase === 'complete' || hand.toAct !== seatIndex) return null;
   const seat = hand.seats[seatIndex]!;
   const toCall = hand.currentBet - seat.committedThisRound;
-  const min = minRaiseTo(hand);
-  const max = maxRaiseTo(hand);
+  const allInTo = seat.committedThisRound + seat.stack;
+
+  // Raising is pointless if nobody else can act, and not allowed if you've
+  // already acted and nobody has made a full raise since.
+  const othersCanAct = hand.seats.some((o) => o.seat !== seat.seat && o.status === 'active');
+  const canRaise = othersCanAct && !seat.hasActedThisRound && allInTo > hand.currentBet;
+
   return {
     canFold: true,
     canCheck: toCall === 0,
-    canCall: toCall > 0 && toCall < seat.stack,
-    callAmount: toCall,
-    canRaise: min <= max,
-    minRaiseTo: min,
-    maxRaiseTo: max,
+    canCall: toCall > 0,
+    callAmount: Math.min(toCall, seat.stack),
+    canRaise,
+    // A raise below the minimum is only legal if it puts you all-in.
+    minRaiseTo: Math.min(hand.currentBet + hand.lastRaiseSize, allInTo),
+    maxRaiseTo: allInTo,
   };
 }

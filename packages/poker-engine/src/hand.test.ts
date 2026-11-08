@@ -3,6 +3,7 @@ import fc from 'fast-check';
 import type { ClientAction } from '@reverse-poker/shared';
 import { computeLegalActions } from './betting';
 import { applyAction, startHand, totalChips } from './hand';
+import { pickAction } from './random-play';
 import type { HandState } from './types';
 import { seededRng, stackedDeck } from './test-utils';
 
@@ -54,10 +55,12 @@ describe('startHand', () => {
     expect(s.toAct).toBe(1);
   });
 
-  it('rejects stacks that are not bigger than the big blind', () => {
-    const players = makePlayers(3);
-    players[1]!.stack = 10;
-    expect(() => startHand({ players, buttonSeat: 0, smallBlind: 5, bigBlind: 10 })).toThrow();
+  it('rejects stacks that are not a whole number of at least 1', () => {
+    for (const bad of [0, -5, 10.5]) {
+      const players = makePlayers(3);
+      players[1]!.stack = bad;
+      expect(() => startHand({ players, buttonSeat: 0, smallBlind: 5, bigBlind: 10 })).toThrow();
+    }
   });
 });
 
@@ -66,7 +69,7 @@ describe('legal actions', () => {
     const s = start3();
     expect(computeLegalActions(s, 0)).toEqual({
       canFold: true, canCheck: false, canCall: true, callAmount: 10,
-      canRaise: true, minRaiseTo: 20, maxRaiseTo: 999,
+      canRaise: true, minRaiseTo: 20, maxRaiseTo: 1000,
     });
     expect(computeLegalActions(s, 1)).toBeNull(); // not their turn
   });
@@ -86,7 +89,7 @@ describe('applyAction validation', () => {
   it('rejects raises below the minimum or above the maximum', () => {
     const s = start3();
     expect(applyAction(s, 'p0', { type: 'raise', amount: 15 })).toEqual({ ok: false, error: 'illegal_raise' });
-    expect(applyAction(s, 'p0', { type: 'raise', amount: 1000 })).toEqual({ ok: false, error: 'illegal_raise' });
+    expect(applyAction(s, 'p0', { type: 'raise', amount: 1001 })).toEqual({ ok: false, error: 'illegal_raise' });
     expect(applyAction(s, 'p0', { type: 'raise', amount: 20.5 })).toEqual({ ok: false, error: 'illegal_raise' });
   });
 
@@ -98,7 +101,7 @@ describe('applyAction validation', () => {
   });
 
   it('a raise sets the new minimum raise', () => {
-    let s = act(start3(), 'p0', { type: 'raise', amount: 30 });
+    const s = act(start3(), 'p0', { type: 'raise', amount: 30 });
     expect(s.currentBet).toBe(30);
     expect(s.lastRaiseSize).toBe(20);
     expect(s.toAct).toBe(1);
@@ -148,17 +151,13 @@ describe('showdown', () => {
     s = play(s, street);
     expect(s.phase).toBe('river');
     expect(s.board).toHaveLength(5);
-    s = play(s, streets3());
+    s = play(s, street);
 
     expect(s.phase).toBe('complete');
     expect(s.result!.showdown).toBe(true);
     expect(s.result!.winners.map((w) => [w.seat, w.amount])).toEqual([[0, 30]]);
     expect(s.seats.map((x) => x.stack)).toEqual([1020, 990, 990]);
     expect(totalChips(s)).toBe(3000);
-
-    function streets3(): [string, ClientAction][] {
-      return [['p1', check], ['p2', check], ['p0', check]];
-    }
   });
 
   it('splits a tied pot and gives the odd chip to the first winner left of the button', () => {
@@ -201,15 +200,7 @@ describe('random play', () => {
 
           while (state.phase !== 'complete' && i + 1 < choices.length) {
             const seat = state.toAct!;
-            const legal = computeLegalActions(state, seat)!;
-            const options: ClientAction[] = [fold];
-            if (legal.canCheck) options.push(check);
-            if (legal.canCall) options.push(call);
-            if (legal.canRaise) {
-              const span = legal.maxRaiseTo - legal.minRaiseTo + 1;
-              options.push({ type: 'raise', amount: legal.minRaiseTo + (choices[i + 1]! % span) });
-            }
-            const action = options[choices[i]! % options.length]!;
+            const action = pickAction(state, choices[i]!, choices[i + 1]!);
             i += 2;
 
             const r = applyAction(state, state.seats[seat]!.playerId, action);

@@ -5,8 +5,8 @@ const RANK_CHAR: Record<number, string> = { 10: 'T', 11: 'J', 12: 'Q', 13: 'K', 
 const fmt = (c: Card) => `${RANK_CHAR[c.rank] ?? c.rank}${c.suit}`;
 
 function printView(view: TableView): void {
-  const pot = view.pots.reduce((sum, p) => sum + p.amount, 0);
-  console.log(`  board: ${view.board.map(fmt).join(' ') || '(none)'}   pot: ${pot}`);
+  const pots = view.pots.map((p) => p.amount).join(' + ') || '0';
+  console.log(`  board: ${view.board.map(fmt).join(' ') || '(none)'}   pot(s): ${pots}`);
   for (const s of view.seats) {
     const cards =
       s.holeCards === null ? '--'
@@ -26,7 +26,8 @@ function printView(view: TableView): void {
 function botAction(state: HandState): ClientAction {
   const legal = computeLegalActions(state, state.toAct!)!;
   const r = Math.random();
-  if (legal.canRaise && r < 0.1) return { type: 'raise', amount: legal.minRaiseTo };
+  if (legal.canRaise && r < 0.08) return { type: 'raise', amount: legal.maxRaiseTo }; // all-in
+  if (legal.canRaise && r < 0.18) return { type: 'raise', amount: legal.minRaiseTo };
   if (legal.canCheck) return { type: 'check' };
   if (legal.canCall && r < 0.85) return { type: 'call' };
   return { type: 'fold' };
@@ -35,8 +36,9 @@ function botAction(state: HandState): ClientAction {
 const describeAction = (a: ClientAction) => (a.type === 'raise' ? `raises to ${a.amount}` : `${a.type}s`);
 
 const names = ['Ann', 'Bob', 'Cy', 'Dee'];
+const stacks = [150, 400, 1000, 1000];
 let state = startHand({
-  players: names.map((name, i) => ({ playerId: `p${i}`, name, stack: 1000 })),
+  players: names.map((name, i) => ({ playerId: `p${i}`, name, stack: stacks[i]! })),
   buttonSeat: 0,
   smallBlind: 5,
   bigBlind: 10,

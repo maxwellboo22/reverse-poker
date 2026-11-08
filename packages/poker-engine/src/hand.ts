@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { Card, ClientAction } from '@reverse-poker/shared';
 import { computeLegalActions } from './betting';
 import { createDeck, cryptoRng, shuffle, type Rng } from './deck';
-import { compareRanks, rankBest } from './evaluator';
+import { compareRanks, rankBest, type HandRank } from './evaluator';
+import { buildPots } from './pots';
 import type {
   ActionError, ActionResult, HandResult, HandState, PlayerId, SeatState,
 } from './types';
@@ -29,6 +30,7 @@ function pay(seat: SeatState, amount: number): void {
   seat.stack -= amount;
   seat.committedThisRound += amount;
   seat.committedThisHand += amount;
+  if (seat.stack === 0) seat.status = 'allIn';
 }
 
 export function startHand(opts: StartHandOptions): HandState {
@@ -40,8 +42,8 @@ export function startHand(opts: StartHandOptions): HandState {
   }
   if (!(smallBlind > 0 && bigBlind >= smallBlind)) throw new Error('bad blinds');
   for (const p of players) {
-    if (!Number.isInteger(p.stack) || p.stack <= bigBlind) {
-      throw new Error('every stack must be larger than the big blind (all-ins arrive in Milestone 2)');
+    if (!Number.isInteger(p.stack) || p.stack < 1) {
+      throw new Error('every stack must be a whole number of at least 1');
     }
   }
 
@@ -59,11 +61,11 @@ export function startHand(opts: StartHandOptions): HandState {
 
   const deck = opts.deck ? [...opts.deck] : shuffle(createDeck(), opts.rng ?? cryptoRng);
 
-  // Heads-up, the button is the small blind.
+  // Heads-up, the button is the small blind. A short stack posts what it has.
   const sbSeat = n === 2 ? buttonSeat : (buttonSeat + 1) % n;
   const bbSeat = (sbSeat + 1) % n;
-  pay(seats[sbSeat]!, smallBlind);
-  pay(seats[bbSeat]!, bigBlind);
+  pay(seats[sbSeat]!, Math.min(smallBlind, seats[sbSeat]!.stack));
+  pay(seats[bbSeat]!, Math.min(bigBlind, seats[bbSeat]!.stack));
 
   // Deal two passes, one card at a time, starting with the small blind.
   const dealt: Card[][] = seats.map(() => []);
@@ -84,13 +86,13 @@ export function startHand(opts: StartHandOptions): HandState {
     buttonSeat,
     smallBlind,
     bigBlind,
-    toAct: (bbSeat + 1) % n,
+    toAct: null,
     currentBet: bigBlind,
     lastRaiseSize: bigBlind,
     pots: [],
     result: null,
   };
-  refreshPots(state);
+  settle(state, bbSeat); // sets toAct (or runs the hand out if nobody can act)
   return state;
 }
 
@@ -112,13 +114,11 @@ export function applyAction(state: HandState, playerId: PlayerId, action: Client
       if (toCall !== 0) return fail('illegal_check');
       seat.hasActedThisRound = true;
       break;
-    case 'call': {
-      const legal = computeLegalActions(s, seatIdx)!;
-      if (!legal.canCall) return fail('illegal_call');
-      pay(seat, toCall);
+    case 'call':
+      if (toCall <= 0) return fail('illegal_call');
+      pay(seat, Math.min(toCall, seat.stack)); // short stacks call all-in for less
       seat.hasActedThisRound = true;
       break;
-    }
     case 'raise': {
       const legal = computeLegalActions(s, seatIdx)!;
       const to = action.amount;
@@ -126,16 +126,20 @@ export function applyAction(state: HandState, playerId: PlayerId, action: Client
         return fail('illegal_raise');
       }
       pay(seat, to - seat.committedThisRound);
-      s.lastRaiseSize = to - s.currentBet;
+      const size = to - s.currentBet;
       s.currentBet = to;
-      for (const o of s.seats) o.hasActedThisRound = false; // everyone must respond
+      if (size >= s.lastRaiseSize) {
+        // A full raise reopens the betting for everyone.
+        s.lastRaiseSize = size;
+        for (const o of s.seats) o.hasActedThisRound = false;
+      } // else: a short all-in. Players who already acted may only call or fold.
       seat.hasActedThisRound = true;
       break;
     }
   }
 
   s.version += 1;
-  advance(s, seatIdx);
+  settle(s, seatIdx);
   return { ok: true, state: s };
 }
 
@@ -152,93 +156,118 @@ function totalCommitted(s: HandState): number {
   return s.seats.reduce((sum, x) => sum + x.committedThisHand, 0);
 }
 
-function refreshPots(s: HandState): void {
-  s.pots = [{
-    amount: totalCommitted(s),
-    eligibleSeats: s.seats.filter((x) => x.status !== 'folded').map((x) => x.seat),
-  }];
-}
-
-function nextLive(s: HandState, from: number): number {
+function nextActive(s: HandState, from: number): number {
   const n = s.seats.length;
   for (let i = 1; i <= n; i++) {
     const idx = (from + i) % n;
-    if (s.seats[idx]!.status !== 'folded') return idx;
+    if (s.seats[idx]!.status === 'active') return idx;
   }
-  throw new Error('no live seats');
+  throw new Error('no active seats');
 }
 
-function advance(s: HandState, from: number): void {
-  refreshPots(s);
+/** After any change: end the hand, move to the next player, or move to the next street. */
+function settle(s: HandState, from: number): void {
+  s.pots = buildPots(s.seats);
+
   const live = s.seats.filter((x) => x.status !== 'folded');
   if (live.length === 1) {
     finish(s, [{ seat: live[0]!.seat, amount: totalCommitted(s), rank: null }], false);
     return;
   }
-  const roundOver = live.every((x) => x.hasActedThisRound && x.committedThisRound === s.currentBet);
-  if (!roundOver) {
-    s.toAct = nextLive(s, from);
+
+  const able = live.filter((x) => x.status === 'active'); // not folded, not all-in
+  const pending = able.filter(
+    (x) => x.committedThisRound < s.currentBet || (able.length > 1 && !x.hasActedThisRound),
+  );
+  if (pending.length === 0) {
+    nextStreet(s);
     return;
   }
-  nextStreet(s);
+
+  const n = s.seats.length;
+  for (let i = 1; i <= n; i++) {
+    const idx = (from + i) % n;
+    if (pending.some((p) => p.seat === idx)) {
+      s.toAct = idx;
+      return;
+    }
+  }
 }
 
 function nextStreet(s: HandState): void {
-  for (const x of s.seats) {
-    x.committedThisRound = 0;
-    x.hasActedThisRound = false;
-  }
-  s.currentBet = 0;
-  s.lastRaiseSize = s.bigBlind;
+  for (;;) {
+    for (const x of s.seats) {
+      x.committedThisRound = 0;
+      x.hasActedThisRound = false;
+    }
+    s.currentBet = 0;
+    s.lastRaiseSize = s.bigBlind;
 
-  switch (s.phase) {
-    case 'preflop':
-      s.deck.pop(); // burn
-      s.board.push(s.deck.pop()!, s.deck.pop()!, s.deck.pop()!);
-      s.phase = 'flop';
-      break;
-    case 'flop':
-      s.deck.pop();
-      s.board.push(s.deck.pop()!);
-      s.phase = 'turn';
-      break;
-    case 'turn':
-      s.deck.pop();
-      s.board.push(s.deck.pop()!);
-      s.phase = 'river';
-      break;
-    case 'river':
-      showdown(s);
+    switch (s.phase) {
+      case 'preflop':
+        s.deck.pop(); // burn
+        s.board.push(s.deck.pop()!, s.deck.pop()!, s.deck.pop()!);
+        s.phase = 'flop';
+        break;
+      case 'flop':
+        s.deck.pop();
+        s.board.push(s.deck.pop()!);
+        s.phase = 'turn';
+        break;
+      case 'turn':
+        s.deck.pop();
+        s.board.push(s.deck.pop()!);
+        s.phase = 'river';
+        break;
+      case 'river':
+        showdown(s);
+        return;
+      default:
+        throw new Error(`cannot advance from phase ${s.phase}`);
+    }
+
+    // If fewer than two players can still bet, deal out the rest of the board.
+    if (s.seats.filter((x) => x.status === 'active').length >= 2) {
+      s.toAct = nextActive(s, s.buttonSeat); // first active seat left of the button
       return;
-    default:
-      throw new Error(`cannot advance from phase ${s.phase}`);
+    }
   }
-  s.toAct = nextLive(s, s.buttonSeat); // first live seat left of the button
 }
 
 function showdown(s: HandState): void {
   const n = s.seats.length;
-  const ranked = s.seats
-    .filter((x) => x.status !== 'folded')
-    .map((x) => ({ seat: x.seat, rank: rankBest([...x.holeCards!, ...s.board]) }));
+  const order = (seat: number) => (seat - s.buttonSeat - 1 + n) % n; // 0 = first left of the button
 
-  let best = ranked[0]!.rank;
-  for (const r of ranked) if (compareRanks(r.rank, best) > 0) best = r.rank;
+  const ranks = new Map<number, HandRank>();
+  for (const x of s.seats) {
+    if (x.status !== 'folded') ranks.set(x.seat, rankBest([...x.holeCards!, ...s.board]));
+  }
 
-  // Winners ordered starting left of the button: they get any odd chips first.
-  const winners = ranked
-    .filter((r) => compareRanks(r.rank, best) === 0)
-    .sort((a, b) => ((a.seat - s.buttonSeat - 1 + n) % n) - ((b.seat - s.buttonSeat - 1 + n) % n));
+  const payouts = new Map<number, number>();
+  for (const pot of buildPots(s.seats)) {
+    const contenders = pot.eligibleSeats;
+    let best = ranks.get(contenders[0]!)!;
+    for (const seat of contenders) {
+      if (compareRanks(ranks.get(seat)!, best) > 0) best = ranks.get(seat)!;
+    }
+    const winners = contenders
+      .filter((seat) => compareRanks(ranks.get(seat)!, best) === 0)
+      .sort((a, b) => order(a) - order(b));
 
-  const pot = totalCommitted(s);
-  const share = Math.floor(pot / winners.length);
-  let remainder = pot - share * winners.length;
-  const payouts = winners.map((w) => {
-    const extra = remainder > 0 ? 1 : 0;
-    remainder -= extra;
-    return { seat: w.seat, amount: share + extra, rank: w.rank };
-  });
-  finish(s, payouts, true);
+    // Odd chips go to the first winners left of the button.
+    const share = Math.floor(pot.amount / winners.length);
+    let remainder = pot.amount - share * winners.length;
+    for (const w of winners) {
+      const extra = remainder > 0 ? 1 : 0;
+      remainder -= extra;
+      payouts.set(w, (payouts.get(w) ?? 0) + share + extra);
+    }
+  }
+
+  const winners = [...payouts.entries()]
+    .sort((a, b) => order(a[0]) - order(b[0]))
+    .map(([seat, amount]) => ({ seat, amount, rank: ranks.get(seat)! }));
+  finish(s, winners, true);
 }
 
 function finish(s: HandState, winners: HandResult['winners'], showdownHappened: boolean): void {
