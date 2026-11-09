@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import type { ClientAction } from './actions';
+import type { ChatSendSchema } from './chat';
+import type { ChatMessage, ChatReply, RuleView } from './chat';
 import type { TableView } from './views';
 
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
@@ -76,6 +78,7 @@ export interface LobbyView {
   hostId: string;
   handInProgress: boolean;
   settings: RoomSettings;
+  houseRules: RuleView[];
   players: LobbyPlayer[];
 }
 
@@ -96,6 +99,10 @@ export interface ClientToServerEvents {
   'game:start': (ack: (res: Ack) => void) => void;
   'game:reset': (ack: (res: Ack) => void) => void;
   'game:action': (payload: ClientAction, ack: (res: Ack) => void) => void;
+  'chat:send': (
+    payload: z.input<typeof ChatSendSchema>,
+    ack: (res: Ack<{ reply?: ChatReply }>) => void,
+  ) => void;
   'host:setChips': (
     payload: z.input<typeof SetChipsSchema>,
     ack: (res: Ack) => void,
@@ -115,4 +122,6 @@ export interface ServerToClientEvents {
   'table:view': (view: TableView) => void;
   'table:clear': () => void;
   'room:kicked': () => void;
+  'chat:message': (message: ChatMessage) => void;
+  'chat:history': (messages: ChatMessage[]) => void;
 }

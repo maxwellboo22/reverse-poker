@@ -1,15 +1,16 @@
 import {
-  createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode,
+  createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode,
 } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import type {
-  Ack, ClientAction, ClientToServerEvents, LobbyView, RoomSettings, ServerToClientEvents,
+  Ack, ChatMessage, ChatReply, ClientAction, ClientToServerEvents, LobbyView, ServerToClientEvents,
   Session, TableView,
 } from '@reverse-poker/shared';
 
 const SERVER_URL =
   (import.meta.env.VITE_SERVER_URL as string | undefined) ?? `http://${window.location.hostname}:3001`;
 const SESSION_KEY = 'reverse-poker-session';
+const MAX_LOCAL_CHAT = 200;
 
 // Per-tab storage: refresh keeps your seat, and each tab can be a different player.
 function loadSession(): Session | null {
@@ -48,12 +49,10 @@ const ERROR_TEXT: Record<string, string> = {
   game_in_progress: 'A hand is in progress. You can join between hands.',
   name_taken: 'Someone in that room already has that name.',
   bad_request: 'Please check what you typed.',
-  blinds_order: "The small blind can't be bigger than the big blind.",
+  rate_limited: "You're sending messages too fast. Wait a moment.",
   not_host: 'Only the host can do that.',
-  cannot_kick_self: "You can't remove yourself. Use Leave room instead.",
   not_enough_players: 'You need at least 2 players with chips.',
   hand_in_progress: 'You can only do that between hands.',
-  no_such_player: 'That player is no longer in the room.',
   not_your_turn: "It's not your turn.",
   illegal_raise: "That raise isn't allowed.",
   illegal_check: "You can't check right now.",
@@ -66,11 +65,17 @@ const ERROR_TEXT: Record<string, string> = {
 
 export const describeError = (code: string): string => ERROR_TEXT[code] ?? `Something went wrong (${code}).`;
 
+/** A chat line. `local` lines are private replies that only this browser shows. */
+export interface ChatLine extends ChatMessage {
+  local?: 'info' | 'error';
+}
+
 interface GameApi {
   connected: boolean;
   session: Session | null;
   lobby: LobbyView | null;
   view: TableView | null;
+  chat: ChatLine[];
   /** A message to show at the top of the page (for example, after being kicked). */
   notice: string | null;
   dismissNotice(): void;
@@ -79,11 +84,9 @@ interface GameApi {
   joinRoom(code: string, name: string): Promise<string | null>;
   leaveRoom(): Promise<string | null>;
   startGame(): Promise<string | null>;
-  resetLobby(): Promise<string | null>;
-  setChips(playerId: string, chips: number): Promise<string | null>;
-  setSettings(settings: RoomSettings): Promise<string | null>;
-  kickPlayer(playerId: string): Promise<string | null>;
   act(action: ClientAction): Promise<string | null>;
+  /** `keep` is true when the text should stay in the input box (it failed). */
+  sendChat(text: string): Promise<{ keep: boolean; error: string | null }>;
 }
 
 const GameContext = createContext<GameApi | null>(null);
@@ -99,13 +102,24 @@ export function GameProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(loadSession);
   const [lobby, setLobby] = useState<LobbyView | null>(null);
   const [view, setView] = useState<TableView | null>(null);
+  const [chat, setChat] = useState<ChatLine[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const localId = useRef(0);
 
   const resetLocal = useCallback(() => {
     saveSession(null);
     setSession(null);
     setLobby(null);
     setView(null);
+    setChat([]);
+  }, []);
+
+  const addLocal = useCallback((text: string, kind: 'info' | 'error') => {
+    setChat((prev) =>
+      [...prev, { id: -(++localId.current), kind: 'system' as const, name: '', text, local: kind }].slice(
+        -MAX_LOCAL_CHAT,
+      ),
+    );
   }, []);
 
   useEffect(() => {
@@ -134,6 +148,10 @@ export function GameProvider({ children }: { children: ReactNode }) {
       resetLocal();
       setNotice('The host removed you from the room.');
     };
+    const onHistory = (messages: ChatMessage[]) => setChat(messages);
+    const onMessage = (m: ChatMessage) =>
+      // The server may send a message both in the history and live: ignore repeats.
+      setChat((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m].slice(-MAX_LOCAL_CHAT)));
 
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
@@ -141,6 +159,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
     socket.on('table:view', onView);
     socket.on('table:clear', onClear);
     socket.on('room:kicked', onKicked);
+    socket.on('chat:history', onHistory);
+    socket.on('chat:message', onMessage);
     if (socket.connected) onConnect();
 
     return () => {
@@ -150,6 +170,8 @@ export function GameProvider({ children }: { children: ReactNode }) {
       socket.off('table:view', onView);
       socket.off('table:clear', onClear);
       socket.off('room:kicked', onKicked);
+      socket.off('chat:history', onHistory);
+      socket.off('chat:message', onMessage);
     };
   }, [resetLocal]);
 
@@ -168,6 +190,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       session,
       lobby,
       view,
+      chat,
       notice,
       dismissNotice: () => setNotice(null),
       createRoom: (name) => enter('room:create', { name }),
@@ -183,28 +206,21 @@ export function GameProvider({ children }: { children: ReactNode }) {
         const res = await request('game:start');
         return res.ok ? null : describeError(res.error);
       },
-      resetLobby: async () => {
-        const res = await request('game:reset');
-        return res.ok ? null : describeError(res.error);
-      },
-      setChips: async (playerId, chips) => {
-        const res = await request('host:setChips', { playerId, chips });
-        return res.ok ? null : describeError(res.error);
-      },
-      setSettings: async (settings) => {
-        const res = await request('host:setSettings', settings);
-        return res.ok ? null : describeError(res.error);
-      },
-      kickPlayer: async (playerId) => {
-        const res = await request('host:kick', { playerId });
-        return res.ok ? null : describeError(res.error);
-      },
       act: async (action) => {
         const res = await request('game:action', action);
         return res.ok ? null : describeError(res.error);
       },
+      sendChat: async (text) => {
+        const res = await request<{ reply?: ChatReply }>('chat:send', { text });
+        if (!res.ok) return { keep: true, error: describeError(res.error) };
+        if (res.reply) {
+          addLocal(res.reply.text, res.reply.ok ? 'info' : 'error');
+          return { keep: !res.reply.ok, error: null };
+        }
+        return { keep: false, error: null };
+      },
     }),
-    [connected, session, lobby, view, notice, enter, resetLocal],
+    [connected, session, lobby, view, chat, notice, enter, resetLocal, addLocal],
   );
 
   return <GameContext.Provider value={api}>{children}</GameContext.Provider>;

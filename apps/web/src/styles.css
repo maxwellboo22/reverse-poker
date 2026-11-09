@@ -44,3 +44,14 @@ select { padding: 8px; border-radius: 6px; border: 1px solid #456; background: #
 .settings input[type='number'] { width: 7em; }
 label.check { display: flex; align-items: center; gap: 8px; }
 .banner button { margin-left: 8px; padding: 2px 10px; }
+.chatlog { height: 240px; overflow-y: auto; background: #14261c; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+.chatmsg { margin: 3px 0; white-space: pre-wrap; word-break: break-word; font-size: 0.95rem; }
+.chatmsg.system { color: #b8c7bd; font-style: italic; }
+.chatmsg.local { font-style: normal; }
+.chatmsg.info { color: #9ecbff; }
+.chatmsg.error { color: #ff8a80; }
+.chatform { display: flex; gap: 8px; }
+.chatform input { flex: 1; }
+.houserules { margin: 8px 0; padding-left: 22px; }
+.houserules li { margin: 4px 0; }
+.houserules li.inactive { opacity: 0.5; text-decoration: line-through; }

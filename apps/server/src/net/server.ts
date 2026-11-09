@@ -2,8 +2,9 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Server, type Socket } from 'socket.io';
 import {
-    ClientActionSchema, CreateRoomSchema, JoinRoomSchema, KickSchema, ResumeSchema, SetChipsSchema,
-  type Ack, type ClientToServerEvents, type ServerToClientEvents,
+  ChatSendSchema, ClientActionSchema, CreateRoomSchema, JoinRoomSchema, KickSchema, ResumeSchema,
+  SetChipsSchema,
+  type Ack, type ChatReply, type ClientToServerEvents, type ServerToClientEvents,
 } from '@reverse-poker/shared';
 import { RoomManager, type Room, type RoomPlayer } from '../game/room';
 
@@ -13,12 +14,15 @@ interface SocketData {
   roomCode?: string;
   playerId?: string;
   failedAttempts: number;
+  chatTimes: number[];
 }
 
 type GameSocket = Socket<ClientToServerEvents, ServerToClientEvents, NoEvents, SocketData>;
 
 const ROOM_IDLE_MS = 10 * 60 * 1000;
 const MAX_FAILED_ATTEMPTS = 10;
+const CHAT_WINDOW_MS = 5000;
+const CHAT_MAX_PER_WINDOW = 6;
 
 export interface GameServerOptions {
   port: number; // 0 = pick a free port (used by tests)
@@ -59,8 +63,10 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   /**
    * THE ONLY place game state leaves the server. Each player gets their own
    * personalised view. Never use io.to(room).emit() for table state.
+   * Chat messages are public, but they go out the same way.
    */
   function broadcast(room: Room): void {
+    const pending = room.takePendingChat();
     for (const player of room.players.values()) {
       if (!player.socketId) continue;
       const socket = io.sockets.sockets.get(player.socketId);
@@ -68,6 +74,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       socket.emit('room:lobby', room.lobbyViewFor(player.playerId));
       const view = room.tableViewFor(player.playerId);
       if (view) socket.emit('table:view', view);
+      for (const message of pending) socket.emit('chat:message', message);
     }
   }
 
@@ -76,6 +83,16 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     for (const player of room.players.values()) {
       if (player.socketId) io.sockets.sockets.get(player.socketId)?.emit('table:clear');
     }
+  }
+
+  /** Cuts a removed player's connection off from the room and tells them why. */
+  function evict(socketId: string | null): void {
+    if (!socketId) return;
+    const kicked = io.sockets.sockets.get(socketId);
+    if (!kicked) return;
+    kicked.data.roomCode = undefined;
+    kicked.data.playerId = undefined;
+    kicked.emit('room:kicked');
   }
 
   function attach(socket: GameSocket, room: Room, player: RoomPlayer): void {
@@ -91,6 +108,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       clearTimeout(timer);
       cleanupTimers.delete(room.code);
     }
+    socket.emit('chat:history', room.getChatHistory());
   }
 
   /** Identity comes from the server-side binding, never from the message. */
@@ -121,6 +139,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
 
   io.on('connection', (socket) => {
     socket.data.failedAttempts = 0;
+    socket.data.chatTimes = [];
 
     socket.on('room:create', (raw, ack) => {
       if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
@@ -216,6 +235,30 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       }
     });
 
+    socket.on('chat:send', (raw, ack) => {
+      const cur = current(socket);
+      if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
+
+      // At most a handful of messages per few seconds per connection.
+      const now = Date.now();
+      const recent = socket.data.chatTimes.filter((t) => now - t < CHAT_WINDOW_MS);
+      if (recent.length >= CHAT_MAX_PER_WINDOW) {
+        socket.data.chatTimes = recent;
+        return respond(ack, { ok: false, error: 'rate_limited' });
+      }
+      recent.push(now);
+      socket.data.chatTimes = recent;
+
+      const parsed = ChatSendSchema.safeParse(raw);
+      if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+
+      const outcome = cur.room.handleChat(cur.playerId, parsed.data.text);
+      if (outcome.kicked) evict(outcome.kicked.socketId);
+      if (outcome.tablesCleared) clearTables(cur.room);
+      respond<{ reply?: ChatReply }>(ack, { ok: true, reply: outcome.reply });
+      broadcast(cur.room);
+    });
+
     socket.on('host:setChips', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
@@ -225,7 +268,8 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       respond(ack, result);
       if (result.ok) broadcast(cur.room);
     });
-        socket.on('host:setSettings', (raw, ack) => {
+
+    socket.on('host:setSettings', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const result = cur.room.setSettings(cur.playerId, raw);
@@ -241,20 +285,11 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
 
       const result = cur.room.kick(cur.playerId, parsed.data.playerId);
       if (!result.ok) return respond(ack, result);
-
-      // Cut the kicked player's connection off from the room, and tell them why.
-      if (result.socketId) {
-        const kicked = io.sockets.sockets.get(result.socketId);
-        if (kicked) {
-          kicked.data.roomCode = undefined;
-          kicked.data.playerId = undefined;
-          kicked.emit('room:kicked');
-        }
-      }
+      evict(result.socketId);
       respond(ack, { ok: true });
       broadcast(cur.room); // the kicked player is already gone from the room, so they get nothing
     });
-    
+
     socket.on('game:action', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
