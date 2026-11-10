@@ -6,7 +6,7 @@ import type { TableView } from './views';
 
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
 export const ROOM_CODE_LENGTH = 5;
-export const MAX_PLAYERS = 6;
+export const MAX_PLAYERS = 10;
 export const MAX_CHIPS = 1_000_000;
 
 // Normalise first (trim, uppercase), then validate.

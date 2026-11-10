@@ -160,6 +160,17 @@ export class Room {
         }
         return { kicked: { socketId: result.socketId } };
       }
+            case 'makeHost': {
+        const result = this.transferHost(playerId, cmd.playerId);
+        if (result.ok) return {};
+        return this.fail(
+          result.error === 'already_host'
+            ? 'That player is already the host.'
+            : result.error === 'offline'
+              ? "You can't make a player who is offline the host."
+              : 'That player is no longer in the room.',
+        );
+      }
       case 'chips':
         return this.changeChips(cmd);
       case 'reset': {
@@ -318,7 +329,18 @@ export class Room {
     this.removePlayer(targetId, false);
     return { ok: true, socketId };
   }
-
+    /** Host only: hands the host role to another player who is online. */
+  transferHost(requesterId: string, targetId: string): Ack {
+    if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };
+    const target = this.players.get(targetId);
+    if (!target) return { ok: false, error: 'no_such_player' };
+    if (targetId === this.hostId) return { ok: false, error: 'already_host' };
+    if (target.socketId === null) return { ok: false, error: 'offline' };
+    const old = this.players.get(requesterId);
+    this.hostId = targetId;
+    this.say(`${target.name} is now the host (appointed by ${old?.name ?? 'the previous host'}).`);
+    return { ok: true };
+  }
   /** Host only. Applies from the next hand; a hand in progress keeps its rules. */
   setSettings(requesterId: string, input: unknown): Ack {
     if (requesterId !== this.hostId) return { ok: false, error: 'not_host' };

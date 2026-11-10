@@ -45,7 +45,7 @@ export function startHand(opts: StartHandOptions): HandState {
   const wrapAroundStraights = opts.wrapAroundStraights ?? false;
 
   const n = players.length;
-  if (n < 2 || n > 9) throw new Error('need 2 to 9 players');
+  if (n < 2 || n > 10) throw new Error('need 2 to 10 players');
   if (!Number.isInteger(buttonSeat) || buttonSeat < 0 || buttonSeat >= n) {
     throw new Error('buttonSeat out of range');
   }

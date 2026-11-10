@@ -25,6 +25,7 @@ export type Command =
   | { kind: 'removeRule'; number: number }
   | { kind: 'clearRules' }
   | { kind: 'kick'; playerId: string }
+  | { kind: 'makeHost'; playerId: string }
   /** mode "set": amount is the new total. mode "add": amount is a signed change. */
   | { kind: 'chips'; playerIds: string[]; mode: 'set' | 'add'; amount: number }
   | { kind: 'reset' }
@@ -60,7 +61,7 @@ export const HELP_TEXT = [
   '  Hand names like "a flush" only count at a showdown.',
   '  /rules (list)    /remove rule 2    /clear rules',
   '',
-  'PLAYERS:  /kick Bob    /reset',
+  'PLAYERS:  /kick Bob    /host Bob (make someone else the host)    /reset',
   '  /chips Bob 500 (set)    /chips Bob +50    /chips Bob -20    /chips everyone 500',
   '  /give Bob 50    /take Bob 20    /give everyone 100',
   '',
@@ -1192,7 +1193,19 @@ function parse(input: string, ctx: ParseContext): Command {
       if (!ref || ref.rest) throw new ParseError(`Who? Try /kick Bob or /kick player 2. ${listPlayers(ctx)}`);
       return { kind: 'kick', playerId: ref.value };
     }
-
+        case 'host':
+    case 'makehost':
+    case 'newhost':
+    case 'promote':
+    case 'transferhost': {
+      const ref = parsePlayerRef(args.replace(/^to\s+/i, ''), ctx);
+      if (!ref || ref.rest) {
+        throw new ParseError(
+          `Who should be the new host? Try /host Bob or /host player 2. ${listPlayers(ctx)}`,
+        );
+      }
+      return { kind: 'makeHost', playerId: ref.value };
+    }
     case 'chips':
     case 'setchips':
       return parseChips(args, ctx);
