@@ -6,10 +6,13 @@ import {
   type RoomSettings, type TableView,
 } from '@reverse-poker/shared';
 import {
-  applyAction, forceFold, startHand, toTableView, type HandState,
+  applyAction, forceFold, rankBest, startHand, toTableView, type HandState,
 } from '@reverse-poker/poker-engine';
-import { HELP_TEXT, parseCommand } from './commands';
-import { MAX_HOUSE_RULES, describeRule, evaluateRules, type Rule, type WinnerInfo } from './rules';
+import { HELP_TEXT, parseCommand, type Command } from './commands';
+import {
+  MAX_HOUSE_RULES, MAX_PLAYER_CHIPS, chipsText, describeRule, evaluateRules,
+  type HandSummary, type Rule, type SeatOutcome,
+} from './rules';
 
 export const STARTING_CHIPS = 1000;
 
@@ -29,6 +32,13 @@ export interface ChatOutcome {
   kicked?: { socketId: string | null };
   /** Set when the lobby was reset, so every client drops its table. */
   tablesCleared?: boolean;
+}
+
+type ChipsCommand = Extract<Command, { kind: 'chips' }>;
+
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names[0] ?? '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
 export class Room {
@@ -150,19 +160,8 @@ export class Room {
         }
         return { kicked: { socketId: result.socketId } };
       }
-      case 'setChips': {
-        const result = this.setChips(playerId, cmd.playerId, cmd.chips);
-        if (!result.ok) {
-          return this.fail(
-            result.error === 'hand_in_progress'
-              ? 'Chips can only be changed between hands.'
-              : result.error === 'no_such_player'
-                ? 'That player is no longer in the room.'
-                : 'That amount is not valid.',
-          );
-        }
-        return {};
-      }
+      case 'chips':
+        return this.changeChips(cmd);
       case 'reset': {
         const result = this.resetLobby(playerId);
         return result.ok ? { tablesCleared: true } : this.fail('Only the host can do that.');
@@ -178,6 +177,61 @@ export class Room {
       default:
         return {};
     }
+  }
+
+  /** /chips, /give and /take: set or adjust chips for one player, several, or everyone. */
+  private changeChips(cmd: ChipsCommand): ChatOutcome {
+    if (this.handInProgress) return this.fail('Chips can only be changed between hands.');
+    const targets = cmd.playerIds
+      .map((id) => this.players.get(id))
+      .filter((p): p is RoomPlayer => p !== undefined);
+    if (targets.length === 0) return this.fail('That player is no longer in the room.');
+    const names = joinNames(targets.map((p) => p.name));
+    const many = targets.length > 1;
+
+    if (cmd.mode === 'set') {
+      if (!Number.isInteger(cmd.amount) || cmd.amount < 0 || cmd.amount > MAX_CHIPS) {
+        return this.fail('That amount is not valid.');
+      }
+      for (const p of targets) p.chips = cmd.amount;
+      this.say(
+        many
+          ? `${names} now have ${chipsText(cmd.amount)} each (set by the host).`
+          : `${names} now has ${chipsText(cmd.amount)} (set by the host).`,
+      );
+      return {};
+    }
+
+    if (cmd.amount > 0) {
+      let gained = 0;
+      for (const p of targets) {
+        const add = Math.min(cmd.amount, MAX_PLAYER_CHIPS - p.chips);
+        p.chips += add;
+        gained += add;
+      }
+      if (gained === 0) return this.fail('Those players are already at the maximum number of chips.');
+      this.say(
+        many
+          ? `${names} were each given ${chipsText(cmd.amount)} by the host.`
+          : `${names} was given ${chipsText(cmd.amount)} by the host (now ${chipsText(targets[0]!.chips)}).`,
+      );
+      return {};
+    }
+
+    const take = -cmd.amount;
+    let removed = 0;
+    for (const p of targets) {
+      const lost = Math.min(take, p.chips);
+      p.chips -= lost;
+      removed += lost;
+    }
+    if (removed === 0) return this.fail('Those players have no chips to remove.');
+    this.say(
+      many
+        ? `${names} each had ${chipsText(take)} removed by the host.`
+        : `${names} had ${chipsText(take)} removed by the host (now ${chipsText(targets[0]!.chips)}).`,
+    );
+    return {};
   }
 
   private changeSettings(playerId: string, patch: Partial<RoomSettings>): ChatOutcome {
@@ -297,7 +351,7 @@ export class Room {
       return { ok: false, error: 'bad_request' };
     }
     target.chips = chips;
-    this.say(`${target.name} now has ${chips.toLocaleString('en-US')} chips (set by the host).`);
+    this.say(`${target.name} now has ${chipsText(chips)} (set by the host).`);
     return { ok: true };
   }
 
@@ -395,20 +449,41 @@ export class Room {
     }
   }
 
+  /** Everything the rules may look at about the hand that just ended. */
+  private buildSummary(hand: HandState): HandSummary {
+    const result = hand.result!;
+    const won = new Map<number, number>();
+    for (const w of result.winners) won.set(w.seat, (won.get(w.seat) ?? 0) + w.amount);
+
+    const seats: SeatOutcome[] = [];
+    for (const s of hand.seats) {
+      if (!s.holeCards) continue;
+      const folded = s.status === 'folded';
+      // Losing hands are ranked too, so "if someone loses with a flush" can work.
+      const rank =
+        result.showdown && !folded && hand.board.length + 2 >= 5
+          ? rankBest([...s.holeCards, ...hand.board], { wrapAroundStraights: hand.wrapAroundStraights })
+          : null;
+      seats.push({
+        playerId: s.playerId,
+        holeCards: s.holeCards,
+        won: won.get(s.seat) ?? 0,
+        folded,
+        allIn: s.status === 'allIn',
+        rank,
+        bet: s.committedThisHand,
+      });
+    }
+    const pot = [...won.values()].reduce((sum, n) => sum + n, 0);
+    return { seats, board: hand.board, showdown: result.showdown, pot };
+  }
+
   private runHouseRules(hand: HandState): void {
     if (this.houseRules.length === 0 || !hand.result) return;
 
-    const winners: WinnerInfo[] = hand.result.winners
-      .filter((w) => w.amount > 0)
-      .flatMap((w) => {
-        const seat = hand.seats[w.seat]!;
-        if (!seat.holeCards || !this.players.has(seat.playerId)) return [];
-        return [{ playerId: seat.playerId, holeCards: seat.holeCards, rank: w.rank }];
-      });
-
     const outcome = evaluateRules(
       this.houseRules,
-      winners,
+      this.buildSummary(hand),
       [...this.players.values()].map((p) => ({ id: p.playerId, name: p.name, chips: p.chips })),
     );
 
