@@ -1,0 +1,30 @@
+services:
+  # The game server (needs a long-running process for WebSockets)
+  - type: web
+    name: reverse-poker-server
+    runtime: node
+    plan: free
+    buildCommand: pnpm install --frozen-lockfile
+    startCommand: pnpm --filter @reverse-poker/server start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      - key: CLIENT_ORIGIN
+        sync: false # you enter this when creating the Blueprint
+
+  # The website (static files)
+  - type: web
+    name: reverse-poker-web
+    runtime: static
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @reverse-poker/web build
+    staticPublishPath: apps/web/dist
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: VITE_SERVER_URL
+        sync: false # you enter this when creating the Blueprint

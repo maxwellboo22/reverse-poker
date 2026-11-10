@@ -60,6 +60,8 @@ const ERROR_TEXT: Record<string, string> = {
   hand_over: 'That hand is over.',
   not_in_room: 'You are not in a room.',
   already_in_room: 'You are already in a room.',
+  server_full: 'The server is full right now. Try again in a few minutes.',
+  server_error: 'Something went wrong on the server. Please try again.',
   timeout: 'The server did not respond.',
 };
 

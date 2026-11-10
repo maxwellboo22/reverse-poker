@@ -6,14 +6,19 @@ import {
   SetChipsSchema,
   type Ack, type ChatReply, type ClientToServerEvents, type ServerToClientEvents,
 } from '@reverse-poker/shared';
+import { DEFAULT_LIMITS, type Limits } from '../config';
 import { RoomManager, type Room, type RoomPlayer } from '../game/room';
+import { SlidingWindow, clientIp } from '../limits';
+import { errorFields, log } from '../log';
 
 type NoEvents = Record<string, never>;
 
 interface SocketData {
   roomCode?: string;
   playerId?: string;
+  ip: string;
   failedAttempts: number;
+  strikes: number;
   chatTimes: number[];
 }
 
@@ -21,12 +26,18 @@ type GameSocket = Socket<ClientToServerEvents, ServerToClientEvents, NoEvents, S
 
 const ROOM_IDLE_MS = 10 * 60 * 1000;
 const MAX_FAILED_ATTEMPTS = 10;
+const MAX_STRIKES = 10;
 const CHAT_WINDOW_MS = 5000;
 const CHAT_MAX_PER_WINDOW = 6;
 
 export interface GameServerOptions {
   port: number; // 0 = pick a free port (used by tests)
+  host?: string;
   clientOrigin?: string | string[];
+  limits?: Partial<Limits>;
+  /** How many proxies sit in front of the server. 0 = none (the default). */
+  trustProxyHops?: number;
+  logClientIps?: boolean;
 }
 
 export interface GameServer {
@@ -41,9 +52,28 @@ function respond<T extends object>(ack: ((res: Ack<T>) => void) | undefined, res
 }
 
 export async function startGameServer(opts: GameServerOptions): Promise<GameServer> {
+  const limits: Limits = { ...DEFAULT_LIMITS, ...opts.limits };
+  const hops = opts.trustProxyHops ?? 0;
+  const origins = Array.isArray(opts.clientOrigin)
+    ? opts.clientOrigin
+    : [opts.clientOrigin ?? 'http://localhost:5173'];
   const rooms = new RoomManager();
 
+  const roomCreates = new SlidingWindow(limits.roomCreatesPerIpPerHour, 60 * 60 * 1000);
+  const failedJoins = new SlidingWindow(limits.failedJoinsPerIpPer5Min, 5 * 60 * 1000);
+  const events = new SlidingWindow(limits.eventsPerSocketPer10s, 10_000);
+  let connections = 0;
+  const connectionsByIp = new Map<string, number>();
+
+  const pruneTimer = setInterval(() => {
+    roomCreates.prune();
+    failedJoins.prune();
+    events.prune();
+  }, 60_000);
+  pruneTimer.unref();
+
   const httpServer = createServer((req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('ok');
@@ -54,11 +84,32 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   });
 
   const io = new Server<ClientToServerEvents, ServerToClientEvents, NoEvents, SocketData>(httpServer, {
-    cors: { origin: opts.clientOrigin ?? 'http://localhost:5173' },
+    cors: { origin: origins },
     maxHttpBufferSize: 16 * 1024, // our messages are tiny; refuse big ones
+    // CORS only protects the polling transport. This also stops other websites from opening a
+    // WebSocket to us. Requests with no Origin header (scripts, tests) are allowed through.
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      callback(null, origin === undefined || origins.includes(origin));
+    },
   });
 
   const cleanupTimers = new Map<string, NodeJS.Timeout>();
+
+  // Refuse new connections when the server or one address has too many.
+  io.use((socket, next) => {
+    const ip = clientIp(socket.handshake.headers, socket.handshake.address, hops);
+    if (connections >= limits.maxConnections) {
+      log('warn', 'connection_refused', { reason: 'server_busy' });
+      return next(new Error('server_busy'));
+    }
+    if ((connectionsByIp.get(ip) ?? 0) >= limits.maxConnectionsPerIp) {
+      log('warn', 'connection_refused', { reason: 'too_many_connections', ip });
+      return next(new Error('too_many_connections'));
+    }
+    socket.data.ip = ip;
+    next();
+  });
 
   /**
    * THE ONLY place game state leaves the server. Each player gets their own
@@ -69,12 +120,16 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     const pending = room.takePendingChat();
     for (const player of room.players.values()) {
       if (!player.socketId) continue;
-      const socket = io.sockets.sockets.get(player.socketId);
-      if (!socket) continue;
-      socket.emit('room:lobby', room.lobbyViewFor(player.playerId));
-      const view = room.tableViewFor(player.playerId);
-      if (view) socket.emit('table:view', view);
-      for (const message of pending) socket.emit('chat:message', message);
+      try {
+        const socket = io.sockets.sockets.get(player.socketId);
+        if (!socket) continue;
+        socket.emit('room:lobby', room.lobbyViewFor(player.playerId));
+        const view = room.tableViewFor(player.playerId);
+        if (view) socket.emit('table:view', view);
+        for (const message of pending) socket.emit('chat:message', message);
+      } catch (e) {
+        log('error', 'broadcast_failed', errorFields(e)); // one broken socket must not stop the rest
+      }
     }
   }
 
@@ -137,18 +192,59 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     cleanupTimers.set(room.code, timer);
   }
 
-  io.on('connection', (socket) => {
-    socket.data.failedAttempts = 0;
-    socket.data.chatTimes = [];
+  /**
+   * Every handler goes through here: it limits how fast one connection can send messages, and a
+   * bug inside a handler becomes an error reply for that one request instead of a server crash.
+   */
+  function on<E extends keyof ClientToServerEvents>(
+    socket: GameSocket,
+    event: E,
+    handler: ClientToServerEvents[E],
+  ): void {
+    const wrapped = (...args: unknown[]): void => {
+      const last = args[args.length - 1];
+      const ack = typeof last === 'function' ? (last as (res: Ack) => void) : undefined;
+      try {
+        if (!events.allow(socket.id)) {
+          socket.data.strikes += 1;
+          respond(ack, { ok: false, error: 'rate_limited' });
+          if (socket.data.strikes >= MAX_STRIKES) socket.disconnect(true);
+          return;
+        }
+        (handler as unknown as (...a: unknown[]) => void)(...args);
+      } catch (e) {
+        log('error', 'handler_failed', { event, ...errorFields(e) });
+        respond(ack, { ok: false, error: 'server_error' });
+      }
+    };
+    socket.on(event, wrapped as never);
+  }
 
-    socket.on('room:create', (raw, ack) => {
+  io.on('connection', (socket) => {
+    const ip = socket.data.ip;
+    connections += 1;
+    connectionsByIp.set(ip, (connectionsByIp.get(ip) ?? 0) + 1);
+    socket.data.failedAttempts = 0;
+    socket.data.strikes = 0;
+    socket.data.chatTimes = [];
+    if (opts.logClientIps) log('info', 'connection', { ip });
+
+    on(socket, 'room:create', (raw, ack) => {
       if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
       const parsed = CreateRoomSchema.safeParse(raw);
       if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+      if (rooms.size >= limits.maxRooms) {
+        log('warn', 'room_cap_reached');
+        return respond(ack, { ok: false, error: 'server_full' });
+      }
+      if (!roomCreates.allow(ip)) return respond(ack, { ok: false, error: 'rate_limited' });
 
       const room = rooms.create();
       const added = room.addPlayer(parsed.data.name);
-      if (!added.ok) return respond(ack, added);
+      if (!added.ok) {
+        rooms.delete(room.code); // never leave an empty room behind
+        return respond(ack, added);
+      }
       attach(socket, room, added.player);
       respond(ack, {
         ok: true,
@@ -157,13 +253,15 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(room);
     });
 
-    socket.on('room:join', (raw, ack) => {
+    on(socket, 'room:join', (raw, ack) => {
       if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
       const parsed = JoinRoomSchema.safeParse(raw);
       if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+      if (failedJoins.isFull(ip)) return respond(ack, { ok: false, error: 'rate_limited' });
 
       const room = rooms.get(parsed.data.code);
       if (!room) {
+        failedJoins.record(ip);
         noteFailure(socket);
         return respond(ack, { ok: false, error: 'room_not_found' });
       }
@@ -177,14 +275,16 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(room);
     });
 
-    socket.on('room:resume', (raw, ack) => {
+    on(socket, 'room:resume', (raw, ack) => {
       if (socket.data.playerId) return respond(ack, { ok: false, error: 'already_in_room' });
       const parsed = ResumeSchema.safeParse(raw);
       if (!parsed.success) return respond(ack, { ok: false, error: 'bad_request' });
+      if (failedJoins.isFull(ip)) return respond(ack, { ok: false, error: 'rate_limited' });
 
       const room = rooms.get(parsed.data.code);
       const player = room?.authenticate(parsed.data.playerId, parsed.data.token);
       if (!room || !player) {
+        failedJoins.record(ip);
         noteFailure(socket);
         return respond(ack, { ok: false, error: 'bad_session' });
       }
@@ -196,7 +296,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(room); // sends this player a fresh personalised snapshot
     });
 
-    socket.on('room:leave', (ack) => {
+    on(socket, 'room:leave', (ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const { room, playerId } = cur;
@@ -216,7 +316,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       }
     });
 
-    socket.on('game:start', (ack) => {
+    on(socket, 'game:start', (ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const result = cur.room.startNextHand(cur.playerId);
@@ -224,7 +324,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       if (result.ok) broadcast(cur.room);
     });
 
-    socket.on('game:reset', (ack) => {
+    on(socket, 'game:reset', (ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const result = cur.room.resetLobby(cur.playerId);
@@ -235,7 +335,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       }
     });
 
-    socket.on('chat:send', (raw, ack) => {
+    on(socket, 'chat:send', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
 
@@ -259,7 +359,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(cur.room);
     });
 
-    socket.on('host:setChips', (raw, ack) => {
+    on(socket, 'host:setChips', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const parsed = SetChipsSchema.safeParse(raw);
@@ -269,7 +369,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       if (result.ok) broadcast(cur.room);
     });
 
-    socket.on('host:setSettings', (raw, ack) => {
+    on(socket, 'host:setSettings', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const result = cur.room.setSettings(cur.playerId, raw);
@@ -277,7 +377,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       if (result.ok) broadcast(cur.room);
     });
 
-    socket.on('host:kick', (raw, ack) => {
+    on(socket, 'host:kick', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const parsed = KickSchema.safeParse(raw);
@@ -290,7 +390,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
       broadcast(cur.room); // the kicked player is already gone from the room, so they get nothing
     });
 
-    socket.on('game:action', (raw, ack) => {
+    on(socket, 'game:action', (raw, ack) => {
       const cur = current(socket);
       if (!cur) return respond(ack, { ok: false, error: 'not_in_room' });
       const parsed = ClientActionSchema.safeParse(raw);
@@ -301,20 +401,30 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     });
 
     socket.on('disconnect', () => {
-      const { roomCode, playerId } = socket.data;
-      if (!roomCode || !playerId) return;
-      const room = rooms.get(roomCode);
-      const player = room?.players.get(playerId);
-      // Ignore stale sockets that were already replaced by a newer connection.
-      if (!room || !player || player.socketId !== socket.id) return;
-      player.socketId = null;
-      broadcast(room);
-      scheduleCleanup(room);
+      connections = Math.max(0, connections - 1);
+      const left = (connectionsByIp.get(ip) ?? 1) - 1;
+      if (left <= 0) connectionsByIp.delete(ip);
+      else connectionsByIp.set(ip, left);
+      events.forget(socket.id);
+
+      try {
+        const { roomCode, playerId } = socket.data;
+        if (!roomCode || !playerId) return;
+        const room = rooms.get(roomCode);
+        const player = room?.players.get(playerId);
+        // Ignore stale sockets that were already replaced by a newer connection.
+        if (!room || !player || player.socketId !== socket.id) return;
+        player.socketId = null;
+        broadcast(room);
+        scheduleCleanup(room);
+      } catch (e) {
+        log('error', 'disconnect_failed', errorFields(e));
+      }
     });
   });
 
   await new Promise<void>((resolve) => {
-    httpServer.listen(opts.port, resolve);
+    httpServer.listen(opts.port, opts.host ?? '0.0.0.0', resolve);
   });
   const port = (httpServer.address() as AddressInfo).port;
 
@@ -323,6 +433,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     rooms,
     close: () =>
       new Promise<void>((resolve) => {
+        clearInterval(pruneTimer);
         for (const timer of cleanupTimers.values()) clearTimeout(timer);
         io.close(() => resolve());
       }),

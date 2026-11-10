@@ -544,6 +544,10 @@ export class RoomManager {
     }
     throw new Error('could not allocate a room code');
   }
+  
+    get size(): number {
+    return this.rooms.size;
+  }
 
   get(code: string): Room | undefined {
     return this.rooms.get(code);
