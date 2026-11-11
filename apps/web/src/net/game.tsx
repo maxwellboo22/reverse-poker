@@ -9,13 +9,19 @@ import type {
 
 const SERVER_URL =
   (import.meta.env.VITE_SERVER_URL as string | undefined) ?? `http://${window.location.hostname}:3001`;
-const SESSION_KEY = 'reverse-poker-session';
+// To test several players in one browser, open the site with ?as=1, ?as=2, and so on:
+// each one then keeps its own seat.
+const SESSION_NAMESPACE = (new URLSearchParams(window.location.search).get('as') ?? '')
+  .replace(/[^a-z0-9_-]/gi, '')
+  .slice(0, 20);
+const SESSION_KEY = SESSION_NAMESPACE ? `reverse-poker-session:${SESSION_NAMESPACE}` : 'reverse-poker-session';
 const MAX_LOCAL_CHAT = 200;
 
 // Per-tab storage: refresh keeps your seat, and each tab can be a different player.
+// Kept in localStorage so your seat survives closing the tab or the browser.
 function loadSession(): Session | null {
   try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
+    const raw = localStorage.getItem(SESSION_KEY);
     return raw ? (JSON.parse(raw) as Session) : null;
   } catch {
     return null;
@@ -24,8 +30,8 @@ function loadSession(): Session | null {
 
 function saveSession(session: Session | null): void {
   try {
-    if (session) sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
-    else sessionStorage.removeItem(SESSION_KEY);
+    if (session) localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    else localStorage.removeItem(SESSION_KEY);
   } catch {
     // storage unavailable: resuming after a refresh just won't work
   }
