@@ -131,12 +131,16 @@ export function GameProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const resume = async () => {
+        const resume = async () => {
       const saved = loadSession();
-      if (!saved) return;
+      if (!saved) {
+        window.alert('DEBUG: no saved seat found in this browser');
+        return;
+      }
       const res = await request<{ session: Session }>('room:resume', {
         code: saved.code, playerId: saved.playerId, token: saved.token,
       });
+      window.alert(`DEBUG: tried to resume room ${saved.code}: ${res.ok ? 'worked' : res.error}`);
       if (res.ok) {
         setSession(res.session);
       } else if (res.error === 'bad_session') {
